@@ -49,12 +49,7 @@ const MC_PROFILE_URL: string = 'https://api.minecraftservices.com/minecraft/prof
 export interface DeviceCode {
   deviceCode: string;
   userCode: string;
-  /** 微软返回的裸入口（历史上是 `www.microsoft.com/link`）。**不要直接打开**：
-   *  浏览器已有登录态时它会跳到账户主页，不渲染设备码输入框。UI 应优先用 complete。 */
   verificationUri: string;
-  /** 「带码」URL：优先用 `verification_uri_complete`；微软没给时由本地拼 `?otc=<user_code>`。
-   *  点开直达授权确认页，免手输，也绕开 `www.microsoft.com/link` 的账户主页跳转。 */
-  verificationUriComplete: string;
   intervalSec: number;
   expiresInSec: number;
 }
@@ -138,10 +133,6 @@ interface DeviceCodeResp {
   device_code?: string;
   user_code?: string;
   verification_uri?: string;
-  /** 微软给的「带码」完整 URL（`?otc=<user_code>`）。点开直接进授权确认页，不用手输。 */
-  verification_uri_complete?: string;
-  /** 微软给的人类可读提示（含链接与过期时间），UI 可直接展示。 */
-  message?: string;
   expires_in?: number;
   interval?: number;
   error?: string;
@@ -324,33 +315,16 @@ export async function requestDeviceCode(clientId: string): Promise<DeviceCode> {
       MsAuthErrorCode[mapped.code], r.code);
     throw mapped;
   }
-  const uri = body.verification_uri ?? 'https://microsoft.com/link';
-  // complete 优先：微软给的（?otc=）> 本地拼（?otc=）> 裸 uri。
-  // 为什么不能只用裸 uri：浏览器已有微软登录态时，www.microsoft.com/link 会直接跳
-  // account.microsoft.com 账户主页（经 complete-client-signin-oauth-silent），
-  // 根本不渲染设备码输入框 ⇒ 用户以为"输过了"，服务端却一直 authorization_pending。
-  let complete = body.verification_uri_complete ?? '';
-  if (complete.length === 0) {
-    complete = `${uri}${uri.indexOf('?') >= 0 ? '&' : '?'}otc=${encodeURIComponent(body.user_code)}`;
-    hilog.info(LOG_DOMAIN, LOG_TAG,
-      'device code: verification_uri_complete absent, built fallback (?otc=)');
-  }
   const res: DeviceCode = {
     deviceCode: body.device_code,
     userCode: body.user_code,
-    verificationUri: uri,
-    verificationUriComplete: complete,
+    verificationUri: body.verification_uri ?? 'https://microsoft.com/link',
     intervalSec: body.interval ?? 5,
     expiresInSec: body.expires_in ?? 900,
   };
   hilog.info(LOG_DOMAIN, LOG_TAG,
-    'device code: got user_code=%{public}s uri=%{public}s complete=%{public}s '
-    + 'interval=%{public}ds expires=%{public}ds',
-    res.userCode, res.verificationUri, res.verificationUriComplete,
-    res.intervalSec, res.expiresInSec);
-  if (body.message !== undefined && body.message.length > 0) {
-    hilog.info(LOG_DOMAIN, LOG_TAG, 'device code: server message=%{public}s', body.message);
-  }
+    'device code: got user_code=%{public}s uri=%{public}s interval=%{public}ds expires=%{public}ds',
+    res.userCode, res.verificationUri, res.intervalSec, res.expiresInSec);
   return res;
 }
 

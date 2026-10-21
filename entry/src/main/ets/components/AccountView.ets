@@ -124,7 +124,6 @@ export struct AccountView {
     this.state.msNoClientId = false;
     this.state.msDeviceUserCode = '';
     this.state.msDeviceUri = '';
-    this.state.msDeviceUriComplete = '';
     this.state.msLoggingIn = true;
     hilog.info(LOG_DOMAIN, LOG_TAG, 'ms-login: start (updateId=%{public}s)',
       updateId.length > 0 ? updateId : '(new)');
@@ -138,7 +137,6 @@ export struct AccountView {
       const r = await loginMicrosoft((d: DeviceCode) => {
         this.state.msDeviceUserCode = d.userCode;
         this.state.msDeviceUri = d.verificationUri;
-        this.state.msDeviceUriComplete = d.verificationUriComplete;
         hilog.info(LOG_DOMAIN, LOG_TAG, 'ms-login: device code shown to user (%{public}s)',
           d.userCode);
       }, clientId);
@@ -162,7 +160,6 @@ export struct AccountView {
       this.state.msLoggingIn = false;
       this.state.msDeviceUserCode = '';
       this.state.msDeviceUri = '';
-      this.state.msDeviceUriComplete = '';
     }
   }
 
@@ -210,18 +207,13 @@ export struct AccountView {
 
   /** 打开系统浏览器到校验地址。 */
   private openVerification(): void {
-    // 优先用「带码」URL。裸 URI（www.microsoft.com/link）在已有登录态的浏览器里会
-    // 经 complete-client-signin-oauth-silent 直接跳到 account.microsoft.com 账户主页，
-    // 不渲染设备码输入框 ⇒ 用户以为输过了，服务端却始终 authorization_pending。
-    const target = this.state.msDeviceUriComplete.length > 0
-      ? this.state.msDeviceUriComplete
-      : this.state.msDeviceUri;
-    hilog.info(LOG_DOMAIN, LOG_TAG, 'ms-login: opening browser for %{public}s', target);
+    hilog.info(LOG_DOMAIN, LOG_TAG, 'ms-login: opening browser for %{public}s',
+      this.state.msDeviceUri);
     try {
       const want: Want = {
         action: 'ohos.want.action.viewData',
         entities: ['entity.system.browsable'],
-        uri: target,
+        uri: this.state.msDeviceUri,
       };
       this.context().startAbility(want).catch((e: Error) => {
         hilog.error(LOG_DOMAIN, LOG_TAG, 'ms-login: startAbility(viewData) failed: %{public}s',
@@ -339,13 +331,8 @@ export struct AccountView {
       }
       if (this.state.msDeviceUserCode.length > 0) {
         Column({ space: LAYOUT_SPACE_SMALL }) {
-          // 展示「带码」URL：用户手动复制到别的浏览器也能直达授权页，不用再找输入框。
-          Text($r('app.string.accounts_ms_instruction',
-            this.state.msDeviceUriComplete.length > 0
-              ? this.state.msDeviceUriComplete
-              : this.state.msDeviceUri))
-            .opacity(OPACITY_SECONDARY)
-            .copyOption(CopyOptions.LocalDevice);
+          Text($r('app.string.accounts_ms_instruction', this.state.msDeviceUri))
+            .opacity(OPACITY_SECONDARY);
           Row({ space: LAYOUT_SPACE }) {
             Text(this.state.msDeviceUserCode)
               .fontWeight(FontWeight.Bold);
