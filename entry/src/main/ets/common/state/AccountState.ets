@@ -29,7 +29,11 @@ export class AccountState {
    */
   @Trace msLoggingIn: boolean = false;
   @Trace msDeviceUserCode: string = '';
+  /** 浏览器入口。**UI 展示/打开时应优先用 `msDeviceUriComplete`**：裸 URI 在已登录的
+   *  浏览器里会跳到账户主页，不显示设备码输入框（2026-10-21 实机踩过）。 */
   @Trace msDeviceUri: string = '';
+  /** 「带码」URL（`?otc=<user_code>`），点开直达授权确认页。 */
+  @Trace msDeviceUriComplete: string = '';
   @Trace msError: MsAuthError | null = null;
   /** 未配置 client_id 的专用提示（UI 走 resource，避免在逻辑里硬编码文案）。 */
   @Trace msNoClientId: boolean = false;
