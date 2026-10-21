@@ -325,15 +325,32 @@ export async function requestDeviceCode(clientId: string): Promise<DeviceCode> {
     throw mapped;
   }
   const uri = body.verification_uri ?? 'https://microsoft.com/link';
-  // complete 优先：微软给的（?otc=）> 本地拼（?otc=）> 裸 uri。
-  // 为什么不能只用裸 uri：浏览器已有微软登录态时，www.microsoft.com/link 会直接跳
-  // account.microsoft.com 账户主页（经 complete-client-signin-oauth-silent），
-  // 根本不渲染设备码输入框 ⇒ 用户以为"输过了"，服务端却一直 authorization_pending。
+  // complete URL 的三级来源：
+  //   ① 微软直接给的 verification_uri_complete（最权威，有就用）
+  //   ② verification_uri 是 www.microsoft.com/link ⇒ 换成 Live Connect 的设备授权页
+  //   ③ 其它 host ⇒ 原样追加 ?otc=
+  //
+  // 为什么 ② 必须换：consumers v2.0 的 devicecode 只回 www.microsoft.com/link，
+  // 这个 host 有两个毛病（2026-10-21 实机）：
+  //   - 浏览器已有微软登录态时会经 complete-client-signin-oauth-silent 直接跳
+  //     account.microsoft.com 账户主页，根本不渲染设备码输入框；
+  //   - 它的 ?otc= 参数不被识别（拼上去仍然要手输，甚至直接报 invalid_request）。
+  // 真正的设备授权页是 login.live.com/oauth20_remoteconnect.srf（v1.0 的
+  // remoteconnect 端点，认 otc 查询参数，且和 v2.0 的 user_code 互通）。
+  const BROKEN_VERIFY_URI = 'https://www.microsoft.com/link';
   let complete = body.verification_uri_complete ?? '';
   if (complete.length === 0) {
-    complete = `${uri}${uri.indexOf('?') >= 0 ? '&' : '?'}otc=${encodeURIComponent(body.user_code)}`;
-    hilog.info(LOG_DOMAIN, LOG_TAG,
-      'device code: verification_uri_complete absent, built fallback (?otc=)');
+    const isBroken = uri === BROKEN_VERIFY_URI || uri === `${BROKEN_VERIFY_URI}/`;
+    if (isBroken) {
+      complete = `https://login.live.com/oauth20_remoteconnect.srf?otc=${encodeURIComponent(body.user_code)}`;
+      hilog.info(LOG_DOMAIN, LOG_TAG,
+        'device code: verification_uri is www.microsoft.com/link (known broken), '
+        + 'using login.live.com/oauth20_remoteconnect.srf?otc=');
+    } else {
+      complete = `${uri}${uri.indexOf('?') >= 0 ? '&' : '?'}otc=${encodeURIComponent(body.user_code)}`;
+      hilog.info(LOG_DOMAIN, LOG_TAG,
+        'device code: verification_uri_complete absent, appended ?otc= to verification_uri');
+    }
   }
   const res: DeviceCode = {
     deviceCode: body.device_code,
