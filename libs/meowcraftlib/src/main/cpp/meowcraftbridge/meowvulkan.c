@@ -2021,7 +2021,7 @@ static int meow_f69_createinfo_is_timeline(const void* ci) {
 // ordinary descriptor path instead of the broken push path.
 //
 // WHAT (all host-side, never a lie about the command stream's semantics):
-//   * vkCreatePipelineLayout is captured into a bounded table so (layout, set) -> its
+//   * vkCreatePipelineLayout is tracked until destruction so (layout, set) -> its
 //     VkDescriptorSetLayout is known. A missing entry is NOT guessed: the real push is forwarded.
 //   * a push is turned into: vkAllocateDescriptorSets(pool) + copy the writes with dstSet set +
 //     vkUpdateDescriptorSets + vkCmdBindDescriptorSets(firstSet=set, count=1, dynamicOffset 0).
@@ -2036,7 +2036,7 @@ static int meow_f69_createinfo_is_timeline(const void* ci) {
 #define MEOW_F72_NPOOLS   64   // F72c (.53): hard cap; pools start at 0 and grow on demand
 #define MEOW_F72_MAXSETS  256
 #define MEOW_F72_PER_TYPE 16
-#define MEOW_F72_LAYOUTS  256
+#define MEOW_F72_LAYOUTS_INITIAL 256
 // F93 (.71, requirement B): force a proven completion boundary once this many pools have been grown
 // in a row with no successful reclaim in between. Far below MEOW_F72_NPOOLS, so the count can never
 // creep to the cap even if fence-signal reclaim is stuck.
@@ -2138,73 +2138,78 @@ static PFN_vkVoidFunctionLocal meow_f72_real(const char* name) {
 }
 
 // ---------------------------------------------------------------- (layout, set) -> setLayout
-typedef struct { uint64_t layout; uint32_t count; VkDescriptorSetLayout* sets; } MeowF72LayoutSlot;
-static MeowF72LayoutSlot g_f72_layouts[MEOW_F72_LAYOUTS];
-static unsigned long g_f72_layout_evicts;
+// These are live-object records, not a cache: evicting an entry can route a later push back to
+// the native path. Grow on demand, release on vkDestroyPipelineLayout, and never evict live data.
+typedef struct { uint64_t layout; uint32_t count; size_t liveRefs; VkDescriptorSetLayout* sets; } MeowF72LayoutSlot;
+static MeowF72LayoutSlot* g_f72_layouts;
+static size_t g_f72_layout_capacity;
 
-static void meow_f72_capture_layout(const void* ci, void* layout) {
-    if (!meow_f72_on() || ci == NULL || layout == NULL) return;
+static int meow_f72_capture_layout(const void* ci, void* layout) {
+    if (!meow_f72_on() || ci == NULL || layout == NULL) return 1;
     const VkPipelineLayoutCreateInfo* pci = (const VkPipelineLayoutCreateInfo*)ci;
     uint32_t n = pci->setLayoutCount;
-    if (n > 0 && pci->pSetLayouts == NULL) return;
+    if (n > 0 && pci->pSetLayouts == NULL) return 0;
     uint64_t key = (uint64_t)(uintptr_t)layout;
-    for (int i = 0; i < MEOW_F72_LAYOUTS; i++) {
-        if (g_f72_layouts[i].layout == key) return;   // already captured
+    size_t slot = g_f72_layout_capacity;
+    for (size_t i = 0; i < g_f72_layout_capacity; i++) {
+        // Without privateData the driver may intern identical non-dispatchable objects.
+        if (g_f72_layouts[i].layout == key) { ++g_f72_layouts[i].liveRefs; return 1; }
+        if (slot == g_f72_layout_capacity && g_f72_layouts[i].layout == 0) slot = i;
     }
-    int slot = -1;
-    for (int i = 0; i < MEOW_F72_LAYOUTS; i++) {
-        if (g_f72_layouts[i].layout == 0) { slot = i; break; }
-    }
-    if (slot < 0) {
-        // Bounded table: drop the oldest (slot 0) and append at the end. Rare; rate-limited.
-        free(g_f72_layouts[0].sets);
-        memmove(&g_f72_layouts[0], &g_f72_layouts[1], (MEOW_F72_LAYOUTS - 1) * sizeof(MeowF72LayoutSlot));
-        memset(&g_f72_layouts[MEOW_F72_LAYOUTS - 1], 0, sizeof(MeowF72LayoutSlot));
-        slot = MEOW_F72_LAYOUTS - 1;
-        unsigned long e = ++g_f72_layout_evicts;
-        if (e <= 4ul || (e % 2000ul) == 0ul)
-            MEOWLOGW("meowvulkan: F72 pipeline-layout table full (%{public}d); evicted oldest (evict#%{public}lu)",
-                     MEOW_F72_LAYOUTS, e);
-    }
+    // Allocate the copy before publishing anything. OOM must leave all live records intact.
     VkDescriptorSetLayout* copy = NULL;
     if (n > 0) {
         copy = (VkDescriptorSetLayout*)calloc(n, sizeof(VkDescriptorSetLayout));
-        if (copy == NULL) { meow_f72_warn("oom-layout-copy", n, 0); return; }
-        for (uint32_t i = 0; i < n; i++) copy[i] = pci->pSetLayouts[i];
+        if (copy == NULL) { meow_f72_warn("oom-layout-copy", n, 0); return 0; }
+        memcpy(copy, pci->pSetLayouts, (size_t)n * sizeof(*copy));
+    }
+    if (slot == g_f72_layout_capacity) {
+        size_t cap = g_f72_layout_capacity ? g_f72_layout_capacity * 2 : MEOW_F72_LAYOUTS_INITIAL;
+        if (cap <= g_f72_layout_capacity || cap > SIZE_MAX / sizeof(*g_f72_layouts)) {
+            free(copy);
+            return 0;
+        }
+        MeowF72LayoutSlot* grown = (MeowF72LayoutSlot*)realloc(g_f72_layouts, cap * sizeof(*grown));
+        if (grown == NULL) { free(copy); meow_f72_warn("oom-layout-table", 0, 0); return 0; }
+        memset(grown + g_f72_layout_capacity, 0, (cap - g_f72_layout_capacity) * sizeof(*grown));
+        g_f72_layouts = grown;
+        g_f72_layout_capacity = cap;
     }
     g_f72_layouts[slot].layout = key;
     g_f72_layouts[slot].count = n;
+    g_f72_layouts[slot].liveRefs = 1;
     g_f72_layouts[slot].sets = copy;
-    // F103 (build 2026-09-23.82 quiet-vk-probes): capture is per DISTINCT pipeline layout, which MC
-    // creates per pipeline (measured 200 lines/run) -- a research probe, so default QUIET. The capture
-    // itself is unchanged; MEOW_VK_VERBOSE=1 restores the line.
     if (meow_vk_verbose())
-        MEOWLOGI("meowvulkan: F72 pipelineLayout captured layout=0x%{public}llx setLayouts=%{public}u slot=%{public}d",
+        MEOWLOGI("meowvulkan: F72 pipelineLayout captured layout=0x%{public}llx setLayouts=%{public}u slot=%{public}zu",
                  (unsigned long long)key, n, slot);
+    return 1;
+}
+
+static void meow_f72_forget_layout(uint64_t key) {
+    if (key == 0) return;
+    for (size_t i = 0; i < g_f72_layout_capacity; i++) {
+        if (g_f72_layouts[i].layout != key) continue;
+        if (--g_f72_layouts[i].liveRefs != 0) return;
+        free(g_f72_layouts[i].sets);
+        memset(&g_f72_layouts[i], 0, sizeof(g_f72_layouts[i]));
+        return;
+    }
 }
 
 static VkDescriptorSetLayout meow_f72_lookup_dsl(void* layout, uint32_t set) {
     uint64_t key = (uint64_t)(uintptr_t)layout;
-    // F87 (.65): last-hit cache for the per-push lookup. The cache is only trusted after re-checking
-    // that the remembered slot still holds this exact key, so an eviction/memmove can never make it
-    // return another layout's sets. Misses fall back to the unchanged full scan -> same result.
-    static int s_last = -1;
-    static uint64_t s_last_key = 0;
-    // F91 (M1 race, review A39 F2): snapshot the remembered index/key into locals and use ONLY them.
-    // The remembered entry is still re-checked against its OWN key (`g_f72_layouts[i].layout == key`),
-    // so under the single render thread the result is byte-for-byte the old one, and a concurrent
-    // rewrite of s_last can no longer make this branch return another layout's set.
-    int li = s_last;
-    uint64_t lk = s_last_key;
-    if (li >= 0 && lk == key && g_f72_layouts[li].layout == key) {
+    // Revalidate the cached index after growth, destroy, and handle reuse. No pointer into a
+    // reallocatable table survives a call, and teardown resets capacity before the next lookup.
+    static size_t s_last = SIZE_MAX;
+    size_t li = s_last;
+    if (li < g_f72_layout_capacity && g_f72_layouts[li].layout == key) {
         if (set < g_f72_layouts[li].count && g_f72_layouts[li].sets != NULL)
             return g_f72_layouts[li].sets[set];
         return VK_NULL_HANDLE;
     }
-    for (int i = 0; i < MEOW_F72_LAYOUTS; i++) {
+    for (size_t i = 0; i < g_f72_layout_capacity; i++) {
         if (g_f72_layouts[i].layout == key) {
             s_last = i;
-            s_last_key = key;
             if (set < g_f72_layouts[i].count && g_f72_layouts[i].sets != NULL)
                 return g_f72_layouts[i].sets[set];
             return VK_NULL_HANDLE;
@@ -2219,14 +2224,16 @@ static VkDescriptorSetLayout meow_f72_lookup_dsl(void* layout, uint32_t set) {
 // with vkAllocateDescriptorSets. Emulating with the original layout would then fail on (almost) every
 // push and silently degrade to forwarding. Fix: capture each set layout's create-info and build a
 // MIRROR layout with the SAME bindings / immutable samplers but WITHOUT the push bit; allocate from
-// the mirror and bind with the ORIGINAL pipeline layout (the push bit does not participate in
-// set-layout compatibility). Mirror creation failure => that layout is not simulatable => push
+// the mirror and bind with the ORIGINAL pipeline layout. TODO: these layouts differ in create flags
+// (VUID-00358); a complete lower-level pipeline-layout translation is still needed. This tracking
+// fix does not establish descriptor compatibility. Mirror creation failure => push
 // forwards. Mirrors are destroyed on vkDestroyDescriptorSetLayout / vkDestroyDevice.
-#define MEOW_F72_DSL_MAX 256
+#define MEOW_F72_DSL_INITIAL 256
 // F99 (.77): the largest binding number a layout may use and still be verifiable for safe set reuse.
 #define MEOW_F72_MAX_BINDINGS 64
 typedef struct {
     uint64_t orig;
+    size_t liveRefs;
     VkDescriptorSetLayout mirror;   // == orig when the push bit is absent; 0 = not simulatable
     uint32_t flags;
     uint32_t bindings;
@@ -2239,65 +2246,55 @@ typedef struct {
     int unverifiable;
     uint16_t bdesc[MEOW_F72_MAX_BINDINGS];
 } MeowF72DslSlot;
-static MeowF72DslSlot g_f72_dsl[MEOW_F72_DSL_MAX];
-static unsigned long g_f72_dsl_evicts, g_f72_dsl_logged;
+static MeowF72DslSlot* g_f72_dsl;
+static size_t g_f72_dsl_capacity;
+static unsigned long g_f72_dsl_logged;
 
 static MeowF72DslSlot* meow_f72_dsl_find(uint64_t key) {
-    // F87 (.65): last-hit cache, validated against the table before use. forget/evict memsets or
-    // memmoves slots, but the remembered index must still carry `key` or the unchanged full scan runs.
-    static int s_last = -1;
-    static uint64_t s_last_key = 0;
-    // F91 (M1 race, review A39 F2): snapshot into locals, then re-check the entry's OWN key before
-    // using it. Single-thread result is unchanged; a concurrent s_last rewrite cannot misdirect it.
-    int li = s_last;
-    uint64_t lk = s_last_key;
-    if (li >= 0 && lk == key && g_f72_dsl[li].orig == key)
+    if (key == 0) return NULL;
+    static size_t s_last = SIZE_MAX;
+    size_t li = s_last;
+    if (li < g_f72_dsl_capacity && g_f72_dsl[li].orig == key)
         return &g_f72_dsl[li];
-    for (int i = 0; i < MEOW_F72_DSL_MAX; i++) {
+    for (size_t i = 0; i < g_f72_dsl_capacity; i++) {
         if (g_f72_dsl[i].orig == key) {
             s_last = i;
-            s_last_key = key;
             return &g_f72_dsl[i];
         }
     }
     return NULL;
 }
 
-static void meow_f72_dsl_log(const MeowF72DslSlot* s, int slot) {
+static void meow_f72_dsl_log(const MeowF72DslSlot* s, size_t slot) {
     unsigned long n = ++g_f72_dsl_logged;
     if (meow_vk_verbose() || n <= 8ul || (n % 2000ul) == 0ul)
         MEOWLOGI("meowvulkan: F72b setLayout #%{public}lu flags=0x%{public}x pushBit=%{public}d bindings=%{public}u "
-                 "slot=%{public}d mirror=%{public}s", n, s->flags, s->pushBit, s->bindings, slot,
+                 "slot=%{public}zu mirror=%{public}s", n, s->flags, s->pushBit, s->bindings, slot,
                  (s->mirror != 0) ? (s->ownsMirror ? "created" : "identity") : "FAILED");
 }
 
-static void meow_f72_capture_dsl(const void* ci, void* orig) {
-    if (!meow_f72_on() || ci == NULL || orig == NULL) return;
+static int meow_f72_capture_dsl(const void* ci, void* orig) {
+    if (!meow_f72_on() || ci == NULL || orig == NULL) return 1;
     uint64_t key = (uint64_t)(uintptr_t)orig;
-    if (meow_f72_dsl_find(key) != NULL) return;
+    MeowF72DslSlot* existing = meow_f72_dsl_find(key);
+    if (existing != NULL) { ++existing->liveRefs; return 1; }
     const VkDescriptorSetLayoutCreateInfo* pci = (const VkDescriptorSetLayoutCreateInfo*)ci;
-    int slot = -1;
-    for (int i = 0; i < MEOW_F72_DSL_MAX; i++) {
-        if (g_f72_dsl[i].orig == 0) { slot = i; break; }
+    size_t slot = 0;
+    for (; slot < g_f72_dsl_capacity; slot++) {
+        if (g_f72_dsl[slot].orig == 0) break;
     }
-    if (slot < 0) {
-        // Evict oldest; destroy its mirror when we own it.
-        MeowF72DslSlot* old = &g_f72_dsl[0];
-        if (old->ownsMirror && old->mirror != 0) {
-            void (*dl)(void*, void*, const void*) =
-                (void (*)(void*, void*, const void*))meow_f72_real("vkDestroyDescriptorSetLayout");
-            if (dl != NULL) dl(g_dev_seen, old->mirror, NULL);
-        }
-        memmove(&g_f72_dsl[0], &g_f72_dsl[1], (MEOW_F72_DSL_MAX - 1) * sizeof(MeowF72DslSlot));
-        memset(&g_f72_dsl[MEOW_F72_DSL_MAX - 1], 0, sizeof(MeowF72DslSlot));
-        slot = MEOW_F72_DSL_MAX - 1;
-        unsigned long e = ++g_f72_dsl_evicts;
-        if (e <= 4ul || (e % 2000ul) == 0ul)
-            MEOWLOGW("meowvulkan: F72b mirror table full (%{public}d); evicted oldest (evict#%{public}lu)",
-                     MEOW_F72_DSL_MAX, e);
+    if (slot == g_f72_dsl_capacity) {
+        size_t cap = g_f72_dsl_capacity ? g_f72_dsl_capacity * 2 : MEOW_F72_DSL_INITIAL;
+        if (cap <= g_f72_dsl_capacity || cap > SIZE_MAX / sizeof(*g_f72_dsl)) return 0;
+        MeowF72DslSlot* grown = (MeowF72DslSlot*)realloc(g_f72_dsl, cap * sizeof(*grown));
+        if (grown == NULL) { meow_f72_warn("oom-set-layout-table", 0, 0); return 0; }
+        memset(grown + g_f72_dsl_capacity, 0, (cap - g_f72_dsl_capacity) * sizeof(*grown));
+        g_f72_dsl = grown;
+        g_f72_dsl_capacity = cap;
     }
     MeowF72DslSlot* s = &g_f72_dsl[slot];
     s->orig = key;
+    s->liveRefs = 1;
     s->flags = pci->flags;
     s->bindings = pci->bindingCount;
     // F99 (.77): capture the binding set (numbers + per-binding descriptorCount) so a push can be
@@ -2343,6 +2340,7 @@ static void meow_f72_capture_dsl(const void* ci, void* orig) {
         }
     }
     meow_f72_dsl_log(s, slot);
+    return 1;
 }
 
 static VkDescriptorSetLayout meow_f72_mirror_of(VkDescriptorSetLayout dsl) {
@@ -2355,6 +2353,7 @@ static VkDescriptorSetLayout meow_f72_mirror_of(VkDescriptorSetLayout dsl) {
 static void meow_f72_forget_dsl(uint64_t key) {
     MeowF72DslSlot* s = meow_f72_dsl_find(key);
     if (s == NULL) return;
+    if (--s->liveRefs != 0) return;
     if (s->ownsMirror && s->mirror != 0) {
         void (*dl)(void*, void*, const void*) =
             (void (*)(void*, void*, const void*))meow_f72_real("vkDestroyDescriptorSetLayout");
@@ -3117,21 +3116,21 @@ static void meow_f72_shutdown(void) {
     g_f72_owned_refs = 0;
     g_f72_npools = 0;
     g_f72_active = -1;
-    for (int i = 0; i < MEOW_F72_LAYOUTS; i++) {
-        free(g_f72_layouts[i].sets);
-        g_f72_layouts[i].sets = NULL;
-        g_f72_layouts[i].layout = 0;
-        g_f72_layouts[i].count = 0;
-    }
-    // F72b: destroy every mirror set layout we created.
-    for (int i = 0; i < MEOW_F72_DSL_MAX; i++) {
+    for (size_t i = 0; i < g_f72_layout_capacity; i++) free(g_f72_layouts[i].sets);
+    free(g_f72_layouts);
+    g_f72_layouts = NULL;
+    g_f72_layout_capacity = 0;
+    // Destroy mirrors only with their original layout or at device teardown, never on table growth.
+    for (size_t i = 0; i < g_f72_dsl_capacity; i++) {
         if (g_f72_dsl[i].ownsMirror && g_f72_dsl[i].mirror != 0) {
             void (*dl)(void*, void*, const void*) =
                 (void (*)(void*, void*, const void*))meow_f72_real("vkDestroyDescriptorSetLayout");
             if (dl != NULL) dl(g_dev_seen, g_f72_dsl[i].mirror, NULL);
         }
-        memset(&g_f72_dsl[i], 0, sizeof(g_f72_dsl[i]));
     }
+    free(g_f72_dsl);
+    g_f72_dsl = NULL;
+    g_f72_dsl_capacity = 0;
 }
 
 static int meow_translate_queue_submit2(void* queue, uint32_t submitCount, const void* submits,
@@ -3966,8 +3965,20 @@ static int log_vkCreatePipelineLayout(void* dev, const void* ci, const void* all
         (MeowF72PFN_createPipelineLayout)meow_resolve_device_fn("vkCreatePipelineLayout");
     if (real == NULL) return -3;
     int rc = real(dev, ci, alloc, out);
-    if (rc == 0 && out != NULL && *out != NULL) meow_f72_capture_layout(ci, *out);
+    if (rc == 0 && out != NULL && *out != NULL && !meow_f72_capture_layout(ci, *out)) {
+        PFN_vkDestroyPipelineLayout destroy = (PFN_vkDestroyPipelineLayout)meow_f72_real("vkDestroyPipelineLayout");
+        if (destroy != NULL) destroy((VkDevice)dev, (VkPipelineLayout)*out, (const VkAllocationCallbacks*)alloc);
+        *out = NULL;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     return rc;
+}
+static void log_vkDestroyPipelineLayout(void* dev, void* layout, const void* alloc) {
+    wd_note("vkDestroyPipelineLayout");
+    PFN_vkDestroyPipelineLayout real = (PFN_vkDestroyPipelineLayout)meow_f72_real("vkDestroyPipelineLayout");
+    if (real == NULL) { MEOWLOGE("meowvulkan: cannot resolve the real vkDestroyPipelineLayout"); return; }
+    if (meow_f72_on()) meow_f72_forget_layout((uint64_t)(uintptr_t)layout);
+    real((VkDevice)dev, (VkPipelineLayout)layout, (const VkAllocationCallbacks*)alloc);
 }
 // F72b (build .50): vkCreateDescriptorSetLayout is hand-written so each layout's flags/bindings can
 // be captured and a push-bit-stripped MIRROR created (see the F72b block above). The destroy side is
@@ -3979,7 +3990,12 @@ static int log_vkCreateDescriptorSetLayout(void* dev, const void* ci, const void
         (MeowF72PFN_createDescriptorSetLayout)meow_resolve_device_fn("vkCreateDescriptorSetLayout");
     if (real == NULL) return -3;
     int rc = real(dev, ci, alloc, out);
-    if (rc == 0 && out != NULL && *out != NULL) meow_f72_capture_dsl(ci, *out);
+    if (rc == 0 && out != NULL && *out != NULL && !meow_f72_capture_dsl(ci, *out)) {
+        PFN_vkDestroyDescriptorSetLayout destroy = (PFN_vkDestroyDescriptorSetLayout)meow_f72_real("vkDestroyDescriptorSetLayout");
+        if (destroy != NULL) destroy((VkDevice)dev, (VkDescriptorSetLayout)*out, (const VkAllocationCallbacks*)alloc);
+        *out = NULL;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     return rc;
 }
 typedef void (*MeowF72PFN_destroyDescriptorSetLayout)(void*, void*, const void*);
@@ -6265,7 +6281,7 @@ static void init_once(void) {
     // Deployment self-certification: this campaign lost a run to "the fix was in the tree but not on
     // the device", so every shim build now names itself. Bump the tag whenever the shim changes.
     // F74 env switch tiers (A/B) are documented in the header comment at the top of this file.
-    MEOWLOGI("meowvulkan: shim build 2026-09-23.83 quiet-f72b-totals");
+    MEOWLOGI("meowvulkan: shim build 2026-11-01.84 live-layout-tracking");
     // Crash backtraces for the Vulkan path are handled by meowbt, which the bridge now installs from
     // meowSetSurfaceId (see egl_gl.c) -- reachable on this path, unlike the GL-only install sites.
     // Enable with the documented envs: MEOW_BT=1 (and optionally MEOW_BT_FILE=<path>).
@@ -6512,7 +6528,7 @@ static void hook_GetPhysicalDeviceFeatures2(VkPhysicalDevice pdev, void* pFeatur
 }
 
 // ------------------------------------------------- hook 3: createDevice copy
-static VkResult hook_CreateDevice(VkPhysicalDevice pdev, const VkDeviceCI* ci, const void* alloc, VkDevice* out) {
+static VkResult meow_create_device(VkPhysicalDevice pdev, const VkDeviceCI* ci, const void* alloc, VkDevice* out) {
     VkResult (*real)(VkPhysicalDevice, const VkDeviceCI*, const void*, VkDevice*) =
         (VkResult(*)(VkPhysicalDevice, const VkDeviceCI*, const void*, VkDevice*))real_proc("vkCreateDevice");
     if (!real) return -3;   // VK_ERROR_INITIALIZATION_FAILED
@@ -6552,6 +6568,18 @@ static VkResult hook_CreateDevice(VkPhysicalDevice pdev, const VkDeviceCI* ci, c
         meow_vk_strip_feature_bits((void*)copy.pNext);
     }
     return real(pdev, &copy, alloc, out);
+}
+
+// Device wrappers may be called after GIPA-only resolution, without a single GDPA lookup.
+// Remember the device and resolve the real GDPA at creation, not only as a GDPA side effect.
+static VkResult hook_CreateDevice(VkPhysicalDevice pdev, const VkDeviceCI* ci, const void* alloc, VkDevice* out) {
+    VkResult rc = meow_create_device(pdev, ci, alloc, out);
+    if (rc == VK_SUCCESS && out != NULL && *out != VK_NULL_HANDLE) {
+        g_dev_seen = *out;
+        if (g_gdpa == NULL)
+            g_gdpa = (PFN_vkVoidFunctionLocal(*)(VkDevice, const char*))real_proc("vkGetDeviceProcAddr");
+    }
+    return rc;
 }
 
 // ------------------------------------------------------------- the exports
@@ -6620,89 +6648,10 @@ static void meow_maybe_install_bt(void) {
     }
 }
 
-PFN_vkVoidFunctionLocal vkGetInstanceProcAddr(VkInstance inst, const char* name) {
-    init_once();
-    wd_maybe_start();
-    wd_touch();
-    /* The Vulkan backend walks none of the GL paths and the surface is injected BEFORE launchJvm, so
-     * the bridge's other install sites are either unreachable (meowMakeCurrent/meowSwapBuffers) or
-     * too early (meowSetSurfaceId). Here is the first moment guaranteed to be *after* HotSpot
-     * installed its SIGSEGV handler -- so the dumper can chain correctly instead of bypassing the JVM.
-     * No-op unless MEOW_BT is set (meow_bt_install_once checks it itself). */
-    meow_maybe_install_bt();
-    if (inst != NULL) g_inst_seen = inst;   // remember it: instance-level forwards need a real instance
-    if (!g_gipa) return NULL;
-    // CRITICAL: LWJGL fetches vkGetDeviceProcAddr THROUGH vkGetInstanceProcAddr. Forwarding that one
-    // lookup to the real loader silently bypasses this shim for every device-level command, so the
-    // KHR->core name mapping never runs -- and MC's vkCmdBeginRenderingKHR (the KHR spelling, which
-    // this ICD only exposes unsuffixed because we had to strip the extension from createDevice)
-    // resolves to NULL and SIGSEGVs. Hand back OUR implementation.
-    if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunctionLocal)vkGetDeviceProcAddr;
-    if (g_hooks) {
-        if (!strcmp(name, "vkEnumerateDeviceExtensionProperties")) return (PFN_vkVoidFunctionLocal)hook_EnumerateDeviceExtensionProperties;
-        if (!strcmp(name, "vkGetPhysicalDeviceFeatures2") ||
-            !strcmp(name, "vkGetPhysicalDeviceFeatures2KHR")) return (PFN_vkVoidFunctionLocal)hook_GetPhysicalDeviceFeatures2;
-        // Platform-specific lead: this GPU's 4-type memory table (one type is LAZILY_ALLOCATED).
-        if (!strcmp(name, "vkGetPhysicalDeviceMemoryProperties")) return (PFN_vkVoidFunctionLocal)hook_GetPhysicalDeviceMemoryProperties;
-        if (!strcmp(name, "vkGetPhysicalDeviceMemoryProperties2") ||
-            !strcmp(name, "vkGetPhysicalDeviceMemoryProperties2KHR")) return (PFN_vkVoidFunctionLocal)hook_GetPhysicalDeviceMemoryProperties2;
-        // F22 (.20): the queue family's timestamp capability (timestampValidBits). Instance-level,
-        // registered by the MAPPED name so the KHR spelling (folded in map_name) reaches this wrapper.
-        if (!strcmp(map_name(name), "vkGetPhysicalDeviceQueueFamilyProperties")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceQueueFamilyProperties;
-        if (!strcmp(map_name(name), "vkGetPhysicalDeviceQueueFamilyProperties2")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceQueueFamilyProperties2;
-        // F9 (.12): WSI surface queries (instance-level; no KHR->core alias exists -- the KHR
-        // suffix is part of the real name). These name the surface capabilities MC built the
-        // swapchain against, most importantly supportedUsageFlags.
-        if (!strcmp(name, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceSurfaceCapabilitiesKHR;
-        if (!strcmp(name, "vkGetPhysicalDeviceSurfaceFormatsKHR")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceSurfaceFormatsKHR;
-        if (!strcmp(name, "vkGetPhysicalDeviceSurfacePresentModesKHR")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceSurfacePresentModesKHR;
-        // F18 (.17): the three DebugUtils label commands are DEVICE-level, but MC resolves them through
-        // this instance path (F17 log: "UNWRAPPED instance vkCmdBeginDebugUtilsLabelEXT" etc.), so they
-        // are registered here as well as in vkGetDeviceProcAddr. Match on map_name(name) like the
-        // device-path table (identity for these EXT names, but never an exact raw-strcmp regression).
-        if (!strcmp(map_name(name), "vkCmdBeginDebugUtilsLabelEXT")) return (PFN_vkVoidFunctionLocal)log_CmdBeginDebugUtilsLabelEXT;
-        if (!strcmp(map_name(name), "vkCmdEndDebugUtilsLabelEXT")) return (PFN_vkVoidFunctionLocal)log_CmdEndDebugUtilsLabelEXT;
-        if (!strcmp(map_name(name), "vkCmdInsertDebugUtilsLabelEXT")) return (PFN_vkVoidFunctionLocal)log_CmdInsertDebugUtilsLabelEXT;
-        // F45: serve the two sync2 entry points from the INSTANCE path too, mirroring the
-        // DebugUtils-label precedent just above. A caller that resolves them through
-        // vkGetInstanceProcAddr (rather than vkGetDeviceProcAddr) would otherwise receive the
-        // ICD's raw function and silently bypass the sync2->v1 translation. map_name() now folds
-        // the KHR spellings onto these core names, so one test covers both.
-        if (!strcmp(map_name(name), "vkQueueSubmit2")) return (PFN_vkVoidFunctionLocal)log_QueueSubmit2;
-        if (!strcmp(map_name(name), "vkCmdPipelineBarrier2")) return (PFN_vkVoidFunctionLocal)log_CmdPipelineBarrier2;
-    }
-    if (!strcmp(name, "vkCreateDevice")) return (PFN_vkVoidFunctionLocal)hook_CreateDevice;
-    if (!strcmp(name, "vkCreateInstance")) return (PFN_vkVoidFunctionLocal)vkCreateInstance;
-    // Diagnostic gap (cost two rounds): instance-level lookups were only logged when they FAILED, so a
-    // name that never reached us -- e.g. LWJGL refusing to resolve a KHR spelling because the extension
-    // is not enabled -- was invisible. MEOW_VK_VERBOSE=1 now logs every instance-level lookup too.
-    if (g_hooks && name != NULL && meow_vk_verbose()) {
-        MEOWLOGI("meowvulkan: gipa lookup: %{public}s (inst=%{public}p)", name, g_inst_seen);
-    }
-    // F17 (.16): last fallback -- after every wrapper decision above, before the real lookup. Any
-    // vkCmd* name still here is unwrapped (the reader can tell this was the instance path).
-    note_unwrapped("instance ", name);
-    // Never forward with a NULL instance when we already know the real one: only GLOBAL commands are
-    // resolvable that way, and callers (LWJGL's VMA bindings among them) do look up device-level
-    // commands here. real_proc() retries through the instance we were given.
-    PFN_vkVoidFunctionLocal out = real_proc(map_name(name));
-    if (out == NULL) {
-        MEOWLOGW("meowvulkan: instance lookup miss: %{public}s (instance=%{public}p)", name, g_inst_seen);
-    }
-    return out;
-}
-
-PFN_vkVoidFunctionLocal vkGetDeviceProcAddr(VkDevice dev, const char* name) {
-    init_once();
-    wd_maybe_start();
-    wd_note(name);
-    if (dev != NULL) g_dev_seen = dev;
-    // F16 (.15): the wrapper table below is keyed on the MAPPED name, not the raw spelling. MC
-    // resolves the KHR spellings (vkCmdBeginRenderingKHR / vkCmdEndRenderingKHR /
-    // vkCmdPushDescriptorSetKHR); map_name() folds those onto the core names the ICD exposes.
-    // Matching on the raw name made the exact-strcmp chain miss them, so the lookup fell through to
-    // the real ICD and OUR wrapper was silently bypassed. map_name() is NULL-safe and is the identity
-    // for every name it does not alias, so `mapped == name` on the non-aliased paths.
+// Device commands can legally be resolved through either GIPA(instance, name) or GDPA.
+// Both paths must see the same create/destroy/submit wrappers or their tracking becomes incomplete.
+static PFN_vkVoidFunctionLocal meow_device_wrapper(const char* name) {
+    if (!g_hooks || name == NULL) return NULL;
     const char* mapped = map_name(name);
     if (g_hooks && !strcmp(mapped, "vkCmdCopyBufferToImage")) {
         return (PFN_vkVoidFunctionLocal)log_CmdCopyBufferToImage;
@@ -6774,16 +6723,15 @@ PFN_vkVoidFunctionLocal vkGetDeviceProcAddr(VkDevice dev, const char* name) {
     }
     // Init-tail probes (entry-only): the last "… CALLED" line printed before death names the call.
     if (g_hooks && !strcmp(mapped, "vkCreatePipelineLayout")) return (PFN_vkVoidFunctionLocal)log_vkCreatePipelineLayout;
+    if (g_hooks && !strcmp(mapped, "vkDestroyPipelineLayout")) return (PFN_vkVoidFunctionLocal)log_vkDestroyPipelineLayout;
     if (g_hooks && !strcmp(mapped, "vkCreateDescriptorSetLayout")) return (PFN_vkVoidFunctionLocal)log_vkCreateDescriptorSetLayout;
     // F72b (build .50): destroy side so each mirror set layout is released with its original.
     if (g_hooks && !strcmp(mapped, "vkDestroyDescriptorSetLayout")) return (PFN_vkVoidFunctionLocal)log_vkDestroyDescriptorSetLayout;
     if (g_hooks && !strcmp(mapped, "vkCreateCommandPool")) return (PFN_vkVoidFunctionLocal)log_vkCreateCommandPool;
-    if (g_hooks && (!strcmp(mapped, "vkCreateSemaphore") ||
-                    (name != NULL && !strcmp(name, "vkCreateSemaphoreKHR")))) return (PFN_vkVoidFunctionLocal)log_vkCreateSemaphore;
+    if (g_hooks && !strcmp(mapped, "vkCreateSemaphore")) return (PFN_vkVoidFunctionLocal)log_vkCreateSemaphore;
     // F69: destroy side of the timeline tracking. Registered by the same style as neighbours; a
     // pure passthrough when MEOW_VK_TIMELINE_AS_FENCE is off.
-    if (g_hooks && (!strcmp(mapped, "vkDestroySemaphore") ||
-                    (name != NULL && !strcmp(name, "vkDestroySemaphoreKHR")))) return (PFN_vkVoidFunctionLocal)log_DestroySemaphore;
+    if (g_hooks && !strcmp(mapped, "vkDestroySemaphore")) return (PFN_vkVoidFunctionLocal)log_DestroySemaphore;
     if (g_hooks && !strcmp(mapped, "vkDestroyDevice")) return (PFN_vkVoidFunctionLocal)log_DestroyDevice;
     if (g_hooks && !strcmp(mapped, "vkCreateFence")) return (PFN_vkVoidFunctionLocal)log_vkCreateFence;
     if (g_hooks && !strcmp(mapped, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunctionLocal)log_vkCreateSwapchainKHR;
@@ -6857,6 +6805,97 @@ PFN_vkVoidFunctionLocal vkGetDeviceProcAddr(VkDevice dev, const char* name) {
     // F22 (.20): the query pool MC writes those timestamps into -- its shape (queryType/queryCount)
     // is hypothesis (b). Device-level, registered by the mapped name like every other create call.
     if (g_hooks && !strcmp(mapped, "vkCreateQueryPool")) return (PFN_vkVoidFunctionLocal)log_CreateQueryPool;
+    return NULL;
+}
+
+PFN_vkVoidFunctionLocal vkGetInstanceProcAddr(VkInstance inst, const char* name) {
+    // Create/DestroySemaphore have never had KHR aliases; do not suffix-strip these invented names.
+    if (name != NULL && (!strcmp(name, "vkCreateSemaphoreKHR") || !strcmp(name, "vkDestroySemaphoreKHR"))) return NULL;
+    init_once();
+    wd_maybe_start();
+    wd_touch();
+    /* The Vulkan backend walks none of the GL paths and the surface is injected BEFORE launchJvm, so
+     * the bridge's other install sites are either unreachable (meowMakeCurrent/meowSwapBuffers) or
+     * too early (meowSetSurfaceId). Here is the first moment guaranteed to be *after* HotSpot
+     * installed its SIGSEGV handler -- so the dumper can chain correctly instead of bypassing the JVM.
+     * No-op unless MEOW_BT is set (meow_bt_install_once checks it itself). */
+    meow_maybe_install_bt();
+    if (inst != NULL) g_inst_seen = inst;   // remember it: instance-level forwards need a real instance
+    if (!g_gipa) return NULL;
+    // CRITICAL: LWJGL fetches vkGetDeviceProcAddr THROUGH vkGetInstanceProcAddr. Forwarding that one
+    // lookup to the real loader silently bypasses this shim for every device-level command, so the
+    // KHR->core name mapping never runs -- and MC's vkCmdBeginRenderingKHR (the KHR spelling, which
+    // this ICD only exposes unsuffixed because we had to strip the extension from createDevice)
+    // resolves to NULL and SIGSEGVs. Hand back OUR implementation.
+    if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunctionLocal)vkGetDeviceProcAddr;
+    if (g_hooks) {
+        if (!strcmp(name, "vkEnumerateDeviceExtensionProperties")) return (PFN_vkVoidFunctionLocal)hook_EnumerateDeviceExtensionProperties;
+        if (!strcmp(name, "vkGetPhysicalDeviceFeatures2") ||
+            !strcmp(name, "vkGetPhysicalDeviceFeatures2KHR")) return (PFN_vkVoidFunctionLocal)hook_GetPhysicalDeviceFeatures2;
+        // Platform-specific lead: this GPU's 4-type memory table (one type is LAZILY_ALLOCATED).
+        if (!strcmp(name, "vkGetPhysicalDeviceMemoryProperties")) return (PFN_vkVoidFunctionLocal)hook_GetPhysicalDeviceMemoryProperties;
+        if (!strcmp(name, "vkGetPhysicalDeviceMemoryProperties2") ||
+            !strcmp(name, "vkGetPhysicalDeviceMemoryProperties2KHR")) return (PFN_vkVoidFunctionLocal)hook_GetPhysicalDeviceMemoryProperties2;
+        // F22 (.20): the queue family's timestamp capability (timestampValidBits). Instance-level,
+        // registered by the MAPPED name so the KHR spelling (folded in map_name) reaches this wrapper.
+        if (!strcmp(map_name(name), "vkGetPhysicalDeviceQueueFamilyProperties")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceQueueFamilyProperties;
+        if (!strcmp(map_name(name), "vkGetPhysicalDeviceQueueFamilyProperties2")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceQueueFamilyProperties2;
+        // F9 (.12): WSI surface queries (instance-level; no KHR->core alias exists -- the KHR
+        // suffix is part of the real name). These name the surface capabilities MC built the
+        // swapchain against, most importantly supportedUsageFlags.
+        if (!strcmp(name, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceSurfaceCapabilitiesKHR;
+        if (!strcmp(name, "vkGetPhysicalDeviceSurfaceFormatsKHR")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceSurfaceFormatsKHR;
+        if (!strcmp(name, "vkGetPhysicalDeviceSurfacePresentModesKHR")) return (PFN_vkVoidFunctionLocal)log_GetPhysicalDeviceSurfacePresentModesKHR;
+
+    }
+    if (inst != NULL) {
+        PFN_vkVoidFunctionLocal wrapper = meow_device_wrapper(name);
+        if (wrapper != NULL) {
+            const char* mapped = map_name(name);
+            // Do not turn unavailable device extensions into apparently available GIPA commands.
+            // Sync2 and push commands are explicit exceptions: the shim translates/emulates them.
+            int emulated = !strcmp(mapped, "vkQueueSubmit2") || !strcmp(mapped, "vkCmdPipelineBarrier2") ||
+                           (meow_f72_on() && (!strcmp(mapped, "vkCmdPushDescriptorSet") ||
+                                            !strcmp(mapped, "vkCmdPushDescriptorSetWithTemplate")));
+            if (emulated || real_proc(mapped) != NULL) return wrapper;
+        }
+    }
+    if (!strcmp(name, "vkCreateDevice")) return (PFN_vkVoidFunctionLocal)hook_CreateDevice;
+    if (!strcmp(name, "vkCreateInstance")) return (PFN_vkVoidFunctionLocal)vkCreateInstance;
+    // Diagnostic gap (cost two rounds): instance-level lookups were only logged when they FAILED, so a
+    // name that never reached us -- e.g. LWJGL refusing to resolve a KHR spelling because the extension
+    // is not enabled -- was invisible. MEOW_VK_VERBOSE=1 now logs every instance-level lookup too.
+    if (g_hooks && name != NULL && meow_vk_verbose()) {
+        MEOWLOGI("meowvulkan: gipa lookup: %{public}s (inst=%{public}p)", name, g_inst_seen);
+    }
+    // F17 (.16): last fallback -- after every wrapper decision above, before the real lookup. Any
+    // vkCmd* name still here is unwrapped (the reader can tell this was the instance path).
+    note_unwrapped("instance ", name);
+    // Never forward with a NULL instance when we already know the real one: only GLOBAL commands are
+    // resolvable that way, and callers (LWJGL's VMA bindings among them) do look up device-level
+    // commands here. real_proc() retries through the instance we were given.
+    PFN_vkVoidFunctionLocal out = real_proc(map_name(name));
+    if (out == NULL) {
+        MEOWLOGW("meowvulkan: instance lookup miss: %{public}s (instance=%{public}p)", name, g_inst_seen);
+    }
+    return out;
+}
+
+PFN_vkVoidFunctionLocal vkGetDeviceProcAddr(VkDevice dev, const char* name) {
+    if (name != NULL && (!strcmp(name, "vkCreateSemaphoreKHR") || !strcmp(name, "vkDestroySemaphoreKHR"))) return NULL;
+    init_once();
+    wd_maybe_start();
+    wd_note(name);
+    if (dev != NULL) g_dev_seen = dev;
+    // F16 (.15): the wrapper table below is keyed on the MAPPED name, not the raw spelling. MC
+    // resolves the KHR spellings (vkCmdBeginRenderingKHR / vkCmdEndRenderingKHR /
+    // vkCmdPushDescriptorSetKHR); map_name() folds those onto the core names the ICD exposes.
+    // Matching on the raw name made the exact-strcmp chain miss them, so the lookup fell through to
+    // the real ICD and OUR wrapper was silently bypassed. map_name() is NULL-safe and is the identity
+    // for every name it does not alias, so `mapped == name` on the non-aliased paths.
+    const char* mapped = map_name(name);
+    PFN_vkVoidFunctionLocal wrapper = meow_device_wrapper(name);
+    if (wrapper != NULL) return wrapper;
     // Diagnostic: log every device-level lookup only when MEOW_VK_VERBOSE=1. It is high volume
     // (hundreds of lines) and perturbs timing, which is exactly what we must NOT do while testing
     // whether an MC-side race is being exposed by our own logging.
